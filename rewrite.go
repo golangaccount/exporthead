@@ -2,7 +2,13 @@ package exporthead
 
 import (
 	"go/ast"
+	"go/parser"
 	"go/token"
+	"path/filepath"
+	"reflect"
+
+	"github.com/golangaccount/cmd.go.internal/load"
+	gos "github.com/golangaccount/go-libs/os"
 )
 
 //重写struct或interface,去掉无法导出部分
@@ -149,4 +155,149 @@ func funcReturnDefaultSelector(sel *ast.SelectorExpr) ast.Expr {
 	return &ast.CompositeLit{
 		Type: sel,
 	}
+}
+
+//重写const，var
+func rewriteValueSpec(spec *ast.ValueSpec) bool {
+	specv := reflect.ValueOf(spec)
+	if specv.IsValid() && !specv.IsNil() {
+		result := make([]*ast.Ident, 0)
+		for _, item := range spec.Names {
+			if item.IsExported() {
+				result = append(result, item)
+			}
+		}
+		if len(result) == 0 {
+			return false
+		}
+		spec.Names = result
+		return true
+	} else if len(spec.Names) == len(spec.Values) {
+		result := make([]*ast.Ident, 0)
+		values := make([]ast.Expr, 0)
+		for i := 0; i < len(spec.Names); i++ {
+			if spec.Names[i].IsExported() {
+				result = append(result, spec.Names[i])
+				values = append(values, spec.Values[i])
+			}
+		}
+		if len(result) == 0 {
+			return false
+		}
+		spec.Names = result
+		spec.Values = values
+		return true
+	} else {
+		mark := false
+		for _, item := range spec.Names {
+			if item.IsExported() {
+				mark = true
+			} else {
+				item.Name = "_"
+			}
+		}
+		return mark
+	}
+}
+
+//重写decl
+func rewriteGenDecl(decl *ast.GenDecl) bool {
+	switch decl.Tok {
+	case token.IMPORT:
+		return true
+	case token.CONST, token.VAR:
+		result := make([]ast.Spec, 0)
+		for i := 0; i < len(decl.Specs); i++ {
+			if rewriteValueSpec(decl.Specs[i].(*ast.ValueSpec)) {
+				result = append(result, decl.Specs[i])
+			}
+		}
+		if len(result) == 0 {
+			return false
+		}
+		decl.Specs = result
+		return true
+	case token.TYPE:
+		return rewriteGenDeclType(decl)
+	default:
+		panic("")
+	}
+}
+
+func rewriteGenDeclType(tp *ast.GenDecl) bool {
+	//此处需要注意的是，type 默认是全部导出的，如果不全部导出的化需要分析对该type类型的依赖，包括 func、struct
+	for _, item := range tp.Specs {
+		spec := item.(*ast.TypeSpec)
+		switch spec.Type.(type) {
+		case *ast.StructType:
+			rewriteFieldList((spec.Type.(*ast.StructType)).Fields)
+		case *ast.InterfaceType:
+			rewriteFieldList((spec.Type.(*ast.InterfaceType)).Methods)
+		default:
+		}
+	}
+	return true
+}
+
+//重写文件的decl
+func rewriteFile(f *ast.File) {
+	decls := make([]ast.Decl, 0)
+	for i := 0; i < len(f.Decls); i++ {
+		switch f.Decls[i].(type) {
+		case *ast.GenDecl:
+			if rewriteGenDecl(f.Decls[i].(*ast.GenDecl)) {
+				decls = append(decls, f.Decls[i])
+			}
+		case *ast.FuncDecl:
+			fd := f.Decls[i].(*ast.FuncDecl)
+			if fd.Recv != nil {
+				if fd.Name.IsExported() {
+					decls = append(decls, fd)
+				}
+			} else {
+				rewriteFunc(fd)
+				decls = append(decls, fd)
+			}
+		}
+	}
+	f.Decls = decls
+}
+
+func ExportPackage(pkgs []string, dest string) {
+	pkgsinfo := load.Packages(pkgs)
+	files := make([]string, 0)
+	dests := make([]string, 0)
+	for _, item := range pkgsinfo {
+		for _, file := range item.GoFiles {
+			files = append(files, filepath.Join(item.Dir, file))
+			dests = append(dests, filepath.Join(dest, item.ImportPath, file))
+		}
+	}
+	ExportFile(files, dests)
+}
+
+func ExportFile(files []string, dest []string) {
+	fset := token.NewFileSet()
+	cfg := &Config{
+		Mode:     UseSpaces | TabIndent,
+		Tabwidth: 8,
+	}
+	for i, item := range files {
+		if fs, err := parser.ParseFile(fset, item, nil, parser.ParseComments); err != nil {
+			panic(err)
+		} else {
+			rewriteFile(fs)
+			writeFileDisk(cfg, fset, fs, dest[i])
+		}
+
+	}
+}
+
+func writeFileDisk(cfg *Config, fset *token.FileSet, f *ast.File, dest string) {
+	fs, err := gos.Create(dest)
+	if err != nil {
+		panic(err)
+	}
+	defer fs.Close()
+	cfg.Fprint(fs, fset, f)
 }
