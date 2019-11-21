@@ -1455,10 +1455,6 @@ func (p *printer) spec(spec ast.Spec, n int, doIndent bool) {
 }
 
 func (p *printer) genDecl(d *ast.GenDecl) {
-	if pass := isExportGenDecl(d); !pass {
-		return
-	}
-
 	p.setComment(d.Doc)
 	p.print(d.Pos(), d.Tok, blank)
 
